@@ -1,8 +1,12 @@
 package com.infocus.pdfsigner.util;
 
 import com.infocus.pdfsigner.config.TokenConfig;
-import org.apache.pdfbox.pdmodel.PDDocument;
-import org.apache.pdfbox.pdmodel.interactive.digitalsignature.*;
+import com.itextpdf.text.DocumentException;
+import com.itextpdf.text.Rectangle;
+import com.itextpdf.text.pdf.PdfReader;
+import com.itextpdf.text.pdf.PdfSignatureAppearance;
+import com.itextpdf.text.pdf.PdfStamper;
+import com.itextpdf.text.pdf.security.*;
 import org.bouncycastle.jce.provider.BouncyCastleProvider;
 import org.springframework.stereotype.Component;
 
@@ -10,8 +14,6 @@ import javax.annotation.PostConstruct;
 import java.io.*;
 import java.security.*;
 import java.security.cert.Certificate;
-import java.security.cert.X509Certificate;
-import java.util.Calendar;
 import java.util.Enumeration;
 
 @Component
@@ -32,84 +34,84 @@ public class Pkcs11SignerUtil {
         String pkcs11Config = "name=" + tokenConfig.getName() + "\n" +
                 "library=" + tokenConfig.getLibrary();
 
+        // Load provider
         ByteArrayInputStream confStream = new ByteArrayInputStream(pkcs11Config.getBytes());
         Provider pkcs11Provider = new sun.security.pkcs11.SunPKCS11(confStream);
         Security.addProvider(pkcs11Provider);
 
         try {
+            // Load keystore
             KeyStore keyStore = KeyStore.getInstance("PKCS11", pkcs11Provider);
             keyStore.load(null, tokenConfig.getPin().toCharArray());
 
-            final String[] selectedAlias = new String[1];
-            final PrivateKey[] privateKey = new PrivateKey[1];
-            final Certificate[][] chain = new Certificate[1][];
-
-            System.out.println("Available aliases:");
-            for (Enumeration<String> aliases = keyStore.aliases(); aliases.hasMoreElements();) {
-                String alias = aliases.nextElement();
-                System.out.println("Alias: " + alias);
-
-                try {
-                    PrivateKey key = (PrivateKey) keyStore.getKey(alias, tokenConfig.getPin().toCharArray());
-                    Certificate[] certs = keyStore.getCertificateChain(alias);
-
-                    if (key != null && certs != null && certs.length > 0) {
-                        selectedAlias[0] = alias;
-                        privateKey[0] = key;
-                        chain[0] = certs;
-                        break;
-                    }
-                } catch (Exception ex) {
-                    System.out.println("Skipping alias due to error: " + alias + " → " + ex.getMessage());
-                }
+            String alias = getPrivateKeyAlias(keyStore);
+            if (alias == null) {
+                throw new Exception("No private key alias found on the token.");
             }
 
-            if (selectedAlias[0] == null || privateKey[0] == null || chain[0] == null) {
-                throw new Exception("No valid private key with certificate chain found in token.");
+            PrivateKey privateKey = (PrivateKey) keyStore.getKey(alias, null);
+            Certificate[] chain = keyStore.getCertificateChain(alias);
+
+            if (privateKey == null || chain == null || chain.length == 0) {
+                throw new Exception("Failed to retrieve private key or certificate chain.");
             }
 
-            // System.out.println("Selected alias: " + selectedAlias[0]);
-            // System.out.println("Private Key: " + privateKey[0].getAlgorithm());
-            // for (int i = 0; i < chain[0].length; i++) {
-            //     System.out.println("Cert " + i + ": " + ((X509Certificate) chain[0][i]).getSubjectX500Principal());
-            // }
-
-            try (PDDocument document = PDDocument.load(new ByteArrayInputStream(inputPdf))) {
-                PDSignature pdfSignature = new PDSignature();
-                pdfSignature.setFilter(PDSignature.FILTER_ADOBE_PPKLITE);
-                pdfSignature.setSubFilter(PDSignature.SUBFILTER_ADBE_PKCS7_DETACHED);
-                pdfSignature.setName(((X509Certificate) chain[0][0]).getSubjectX500Principal().getName());
-                pdfSignature.setLocation("India");
-                pdfSignature.setReason("Digital Approval");
-                pdfSignature.setSignDate(Calendar.getInstance());
-
-                SignatureInterface signatureInterface = new SignatureInterface() {
-                    @Override
-                    public byte[] sign(InputStream content) throws IOException {
-                        try {
-                            Signature signer = Signature.getInstance("SHA256withRSA");
-                            signer.initSign(privateKey[0]);
-                            byte[] buffer = new byte[8192];
-                            int read;
-                            while ((read = content.read(buffer)) > 0) {
-                                signer.update(buffer, 0, read);
-                            }
-                            return signer.sign();
-                        } catch (Exception e) {
-                            throw new IOException("Error signing PDF", e);
-                        }
-                    }
-                };
-
-                document.addSignature(pdfSignature, signatureInterface);
-                ByteArrayOutputStream signedOut = new ByteArrayOutputStream();
-                document.saveIncremental(signedOut);
-                return signedOut.toByteArray();
-            }
-
+            return signPdfWithIText(inputPdf, privateKey, chain);
         } finally {
             Security.removeProvider(pkcs11Provider.getName());
         }
     }
 
+    private String getPrivateKeyAlias(KeyStore keyStore) throws KeyStoreException {
+        Enumeration<String> aliases = keyStore.aliases();
+        while (aliases.hasMoreElements()) {
+            String alias = aliases.nextElement();
+            if (keyStore.isKeyEntry(alias)) {
+                return alias;
+            }
+        }
+        return null;
+    }
+
+    private byte[] signPdfWithIText(byte[] inputPdf, PrivateKey privateKey, Certificate[] chain)
+            throws IOException, DocumentException, GeneralSecurityException {
+
+        PdfReader reader = new PdfReader(new ByteArrayInputStream(inputPdf));
+        ByteArrayOutputStream outputStream = new ByteArrayOutputStream();
+        PdfStamper stamper = PdfStamper.createSignature(reader, outputStream, '\0');
+
+        PdfSignatureAppearance appearance = stamper.getSignatureAppearance();
+        appearance.setReason("Document Signing");
+        appearance.setLocation("India");
+        appearance.setVisibleSignature(new Rectangle(420f, 40f, 580f, 130f), 1, "Authorized Signatory");
+        appearance.setLayer2Font(new com.itextpdf.text.Font(com.itextpdf.text.Font.FontFamily.HELVETICA, 7));
+
+        ExternalDigest digest = new BouncyCastleDigest();
+        ExternalSignature signature = new PrivateKeySignature(privateKey, DigestAlgorithms.SHA256, "SunPKCS11-Token");
+
+        MakeSignature.signDetached(
+                appearance,
+                digest,
+                signature,
+                chain,
+                null,
+                null,
+                null,
+                0,
+                MakeSignature.CryptoStandard.CMS);
+
+        return outputStream.toByteArray();
+    }
 }
+// This code is a utility class for signing PDF documents using a PKCS#11 token.
+// It uses the iText library for PDF manipulation and Bouncy Castle for
+// cryptographic operations. The class is annotated with @Component, making it a
+// Spring-managed bean. The signPdf method takes a byte array representing the
+// input PDF, retrieves the private key and certificate chain from the PKCS#11
+// token, and signs the PDF. The signed PDF is returned as a byte array.
+// The class also includes methods for initializing the Bouncy Castle provider,
+// loading the PKCS#11 keystore, and signing the PDF using iText. The use of
+// annotations like @PostConstruct indicates that the init method will be called
+// after the bean's properties have been set, ensuring that the Bouncy Castle
+// provider is added to the security framework before any signing operations are
+// performed.
